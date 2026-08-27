@@ -1,8 +1,55 @@
 """WebSocket wire kernels exported through a small C ABI."""
 
-from std.sys import simd_width_of
+from std.runtime import initialize_runtime
+from std.runtime.asyncrt import TaskGroup
+from std.sys.info import simd_width_of as simdwidthof
 
 comptime BPtr = Pointer[UInt8, AnyOrigin[mut=True]]
+comptime W = simdwidthof[DType.float64]()
+comptime MASK_CHUNK_SIZE = 1024 * 1024
+comptime MASK_WORKERS = 4
+
+
+@always_inline
+def sync_parallelize[FuncType: def(Int) -> None](func: FuncType, count: Int):
+    @__parameter
+    @always_inline
+    def wrapped(i: Int):
+        func(i)
+
+    @always_inline
+    @__parameter
+    async def task_fn(i: Int):
+        wrapped(i)
+
+    var tasks = TaskGroup()
+    for i in range(count):
+        tasks.create_task(task_fn(i))
+    tasks.wait()
+
+
+@always_inline
+def parallelize[
+    origins: OriginSet,
+    //,
+    func: def(Int) capturing[origins] -> None,
+](num_work_items: Int, num_workers: Int):
+    var workers = min(num_work_items, num_workers)
+    if workers <= 1:
+        for i in range(num_work_items):
+            func(i)
+        return
+
+    var chunk_size, extra_items = divmod(num_work_items, workers)
+
+    @always_inline
+    def worker(worker_index: Int) {imm chunk_size, imm extra_items}:
+        var start = worker_index * chunk_size + min(worker_index, extra_items)
+        for i in range(chunk_size + Int(worker_index < extra_items)):
+            func(start + i)
+
+    initialize_runtime()
+    sync_parallelize(worker, workers)
 
 
 def bytes_ptr(addr: Int) -> BPtr:
@@ -10,7 +57,6 @@ def bytes_ptr(addr: Int) -> BPtr:
 
 
 def copy_bytes(src: BPtr, dst: BPtr, n: Int):
-    comptime W = simd_width_of[DType.uint64]()
     var src_words = src.unsafe_bitcast[UInt64]()
     var dst_words = dst.unsafe_bitcast[UInt64]()
     var words = n // 8
@@ -33,7 +79,6 @@ def copy_bytes(src: BPtr, dst: BPtr, n: Int):
 
 
 def mask_copy(src: BPtr, dst: BPtr, n: Int, mask: Int):
-    comptime W = simd_width_of[DType.uint64]()
     comptime UNROLL = 4
     var src_words = src.unsafe_bitcast[UInt64]()
     var dst_words = dst.unsafe_bitcast[UInt64]()
@@ -79,10 +124,15 @@ def mask_copy(src: BPtr, dst: BPtr, n: Int, mask: Int):
 
 
 def mask_copy_parallel(src: BPtr, dst: BPtr, n: Int, mask: Int):
-    # `parallelize` moved from the Mojo standard library to MAX in Mojo 1.1.
-    # Keep the separate entry point selected by the Python API without making
-    # this small extension depend on the full MAX package.
-    mask_copy(src, dst, n, mask)
+    var chunks = (n + MASK_CHUNK_SIZE - 1) // MASK_CHUNK_SIZE
+
+    @__parameter
+    def mask_chunk(chunk: Int):
+        var offset = chunk * MASK_CHUNK_SIZE
+        var size = min(MASK_CHUNK_SIZE, n - offset)
+        mask_copy(src.unsafe_offset(offset), dst.unsafe_offset(offset), size, mask)
+
+    parallelize[mask_chunk](chunks, MASK_WORKERS)
 
 
 @export("mws_apply_mask")

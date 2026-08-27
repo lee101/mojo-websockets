@@ -14,7 +14,7 @@ import websockets.utils as reference_utils
 
 import mojo_websockets.frames as frames
 import mojo_websockets.utils as mojo_utils
-from mojo_websockets._lib import bytes_address, lib, source_buffer
+from mojo_websockets._lib import bytes_address, lib, new_bytes, source_buffer
 from mojo_websockets.exceptions import PayloadTooBig, ProtocolError
 from mojo_websockets.utils import apply_mask
 
@@ -126,6 +126,24 @@ def test_native_mask_rejects_invalid_lengths_and_null_pointers():
     assert lib().mws_apply_mask(
         0, bytes_address(destination), 9, 8, len(destination), 0, 0
     ) == -1
+
+
+def test_native_parallel_mask_handles_chunk_and_simd_tail():
+    length = 1024 * 1024 + 13
+    source = bytes((index * 37 + 11) & 255 for index in range(length))
+    destination = new_bytes(length)
+    mask = b"\x12\x34\x56\x78"
+    status = lib().mws_apply_mask(
+        bytes_address(source),
+        bytes_address(destination),
+        length,
+        length,
+        length,
+        int.from_bytes(mask, "little"),
+        1,
+    )
+    assert status == 0
+    assert destination == reference_utils.apply_mask(source, mask)
 
 
 def test_native_serializer_rejects_undersized_destination():

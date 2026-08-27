@@ -73,12 +73,12 @@ enabled.
 
 | operation | Mojo | upstream websockets | speedup |
 | --- | ---: | ---: | ---: |
-| `apply_mask` 64 B | 1.44 us | 215.7 ns | 0.15x |
-| `apply_mask` 4,096 B | 6.75 us | 644.2 ns | 0.10x |
-| `apply_mask` 1,048,576 B | 109.54 us | 89.20 us | 0.81x |
-| `apply_mask` 16,777,216 B | 2.03 ms | 6.68 ms | 3.30x |
-| serialize unmasked 1 MiB | 86.47 us | 92.80 us | 1.07x |
-| serialize masked 1 MiB | 142.71 us | 223.43 us | 1.57x |
+| `apply_mask` 64 B | 1.31 us | 213.2 ns | 0.16x |
+| `apply_mask` 4,096 B | 4.48 us | 397.5 ns | 0.09x |
+| `apply_mask` 1,048,576 B | 104.09 us | 90.29 us | 0.87x |
+| `apply_mask` 16,777,216 B | 942.43 us | 2.44 ms | 2.59x |
+| serialize unmasked 1 MiB | 85.83 us | 95.48 us | 1.11x |
+| serialize masked 1 MiB | 103.52 us | 179.38 us | 1.73x |
 
 Small standalone mask calls are slower because the fixed ctypes transition
 cost is much larger than the work. Large masks use four CPU workers; masked
