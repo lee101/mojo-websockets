@@ -1,9 +1,8 @@
 """WebSocket wire kernels exported through a small C ABI."""
 
-from std.algorithm import parallelize
 from std.sys import simd_width_of
 
-comptime BPtr = UnsafePointer[UInt8, AnyOrigin[mut=True]]
+comptime BPtr = Pointer[UInt8, AnyOrigin[mut=True]]
 
 
 def bytes_ptr(addr: Int) -> BPtr:
@@ -12,82 +11,78 @@ def bytes_ptr(addr: Int) -> BPtr:
 
 def copy_bytes(src: BPtr, dst: BPtr, n: Int):
     comptime W = simd_width_of[DType.uint64]()
-    var src_words = src.bitcast[UInt64]()
-    var dst_words = dst.bitcast[UInt64]()
+    var src_words = src.unsafe_bitcast[UInt64]()
+    var dst_words = dst.unsafe_bitcast[UInt64]()
     var words = n // 8
     var vector_end = words - words % W
     var word = 0
     while word < vector_end:
-        dst_words.store[alignment=1](
-            word, src_words.load[width=W, alignment=1](word)
+        dst_words.unsafe_store[alignment=1](
+            word, src_words.unsafe_load[width=W, alignment=1](word)
         )
         word += W
     while word < words:
-        dst_words.store[alignment=1](
-            word, src_words.load[alignment=1](word)
+        dst_words.unsafe_store[alignment=1](
+            word, src_words.unsafe_load[alignment=1](word)
         )
         word += 1
     var i = words * 8
     while i < n:
-        dst[i] = src[i]
+        dst[unsafe_offset=i] = src[unsafe_offset=i]
         i += 1
 
 
 def mask_copy(src: BPtr, dst: BPtr, n: Int, mask: Int):
     comptime W = simd_width_of[DType.uint64]()
     comptime UNROLL = 4
-    var src_words = src.bitcast[UInt64]()
-    var dst_words = dst.bitcast[UInt64]()
+    var src_words = src.unsafe_bitcast[UInt64]()
+    var dst_words = dst.unsafe_bitcast[UInt64]()
     var repeated = UInt64(mask) | (UInt64(mask) << 32)
     var pattern = SIMD[DType.uint64, W](repeated)
     var words = n // 8
     var unrolled_end = words - words % (W * UNROLL)
     var word = 0
     while word < unrolled_end:
-        dst_words.store[alignment=1](
-            word, src_words.load[width=W, alignment=1](word) ^ pattern
+        dst_words.unsafe_store[alignment=1](
+            word, src_words.unsafe_load[width=W, alignment=1](word) ^ pattern
         )
-        dst_words.store[alignment=1](
+        dst_words.unsafe_store[alignment=1](
             word + W,
-            src_words.load[width=W, alignment=1](word + W) ^ pattern,
+            src_words.unsafe_load[width=W, alignment=1](word + W) ^ pattern,
         )
-        dst_words.store[alignment=1](
+        dst_words.unsafe_store[alignment=1](
             word + 2 * W,
-            src_words.load[width=W, alignment=1](word + 2 * W) ^ pattern,
+            src_words.unsafe_load[width=W, alignment=1](word + 2 * W) ^ pattern,
         )
-        dst_words.store[alignment=1](
+        dst_words.unsafe_store[alignment=1](
             word + 3 * W,
-            src_words.load[width=W, alignment=1](word + 3 * W) ^ pattern,
+            src_words.unsafe_load[width=W, alignment=1](word + 3 * W) ^ pattern,
         )
         word += W * UNROLL
     var vector_end = words - words % W
     while word < vector_end:
-        dst_words.store[alignment=1](
-            word, src_words.load[width=W, alignment=1](word) ^ pattern
+        dst_words.unsafe_store[alignment=1](
+            word, src_words.unsafe_load[width=W, alignment=1](word) ^ pattern
         )
         word += W
     while word < words:
-        dst_words.store[alignment=1](
-            word, src_words.load[alignment=1](word) ^ repeated
+        dst_words.unsafe_store[alignment=1](
+            word, src_words.unsafe_load[alignment=1](word) ^ repeated
         )
         word += 1
     var i = words * 8
     while i < n:
-        dst[i] = src[i] ^ UInt8((mask >> ((i & 3) * 8)) & 255)
+        dst[unsafe_offset=i] = src[unsafe_offset=i] ^ UInt8(
+            (mask >> ((i & 3) * 8)) & 255
+        )
         i += 1
 
 
 def mask_copy_parallel(src: BPtr, dst: BPtr, n: Int, mask: Int):
-    comptime CHUNK_SIZE = 1024 * 1024
-    var num_chunks = (n + CHUNK_SIZE - 1) // CHUNK_SIZE
-
-    @parameter
-    def apply_chunk(chunk: Int):
-        var offset = chunk * CHUNK_SIZE
-        var chunk_size = min(CHUNK_SIZE, n - offset)
-        mask_copy(src + offset, dst + offset, chunk_size, mask)
-
-    parallelize[apply_chunk](num_chunks, 4)
+    # `parallelize` moved from the Mojo standard library to MAX in Mojo 1.1.
+    # Keep the separate entry point selected by the Python API without making
+    # this small extension depend on the full MAX package.
+    mask_copy(src, dst, n, mask)
 
 
 @export("mws_apply_mask")
@@ -136,37 +131,37 @@ def mws_serialize_frame(
     if n > 0 and src_addr == 0:
         return -2
     var dst = bytes_ptr(dst_addr)
-    dst[0] = UInt8(head1)
+    dst[unsafe_offset=0] = UInt8(head1)
     var offset = 2
     var mask_bit = 128 if masked != 0 else 0
 
     if n < 126:
-        dst[1] = UInt8(mask_bit | n)
+        dst[unsafe_offset=1] = UInt8(mask_bit | n)
     elif n < 65536:
-        dst[1] = UInt8(mask_bit | 126)
-        dst[2] = UInt8((n >> 8) & 255)
-        dst[3] = UInt8(n & 255)
+        dst[unsafe_offset=1] = UInt8(mask_bit | 126)
+        dst[unsafe_offset=2] = UInt8((n >> 8) & 255)
+        dst[unsafe_offset=3] = UInt8(n & 255)
         offset = 4
     else:
-        dst[1] = UInt8(mask_bit | 127)
+        dst[unsafe_offset=1] = UInt8(mask_bit | 127)
         for j in range(8):
-            dst[2 + j] = UInt8((n >> ((7 - j) * 8)) & 255)
+            dst[unsafe_offset=2 + j] = UInt8((n >> ((7 - j) * 8)) & 255)
         offset = 10
 
     if masked != 0:
-        dst[offset] = UInt8(mask & 255)
-        dst[offset + 1] = UInt8((mask >> 8) & 255)
-        dst[offset + 2] = UInt8((mask >> 16) & 255)
-        dst[offset + 3] = UInt8((mask >> 24) & 255)
+        dst[unsafe_offset=offset] = UInt8(mask & 255)
+        dst[unsafe_offset=offset + 1] = UInt8((mask >> 8) & 255)
+        dst[unsafe_offset=offset + 2] = UInt8((mask >> 16) & 255)
+        dst[unsafe_offset=offset + 3] = UInt8((mask >> 24) & 255)
         offset += 4
 
     if n > 0:
         var src = bytes_ptr(src_addr)
         if masked != 0:
             if use_parallel != 0:
-                mask_copy_parallel(src, dst + offset, n, mask)
+                mask_copy_parallel(src, dst.unsafe_offset(offset), n, mask)
             else:
-                mask_copy(src, dst + offset, n, mask)
+                mask_copy(src, dst.unsafe_offset(offset), n, mask)
         else:
-            copy_bytes(src, dst + offset, n)
+            copy_bytes(src, dst.unsafe_offset(offset), n)
     return offset + n
