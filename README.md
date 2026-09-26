@@ -103,10 +103,12 @@ boundary.
 
 The mask kernel processes unaligned `UInt64` vectors with the four-byte key
 repeated across each word, unrolls four SIMD vectors per iteration, then handles
-whole-word and byte tails serially. At 4 MiB and above, `parallelize` distributes
-1 MiB chunks over four CPU workers; smaller inputs remain serial. The async CPU
-runtime is initialized lazily, and failure to initialize selects the serial
-path. The frame kernel writes the network-order header and optional mask key
+whole-word and byte tails serially. Masking is a pure read-XOR-write pass over
+contiguous bytes — well under two operations per byte moved — so it stays on one
+serial code path at every length. Mojo 1.2.0 removed `std.runtime.asyncrt`, and a
+4 MiB threaded mask was measured slower than the serial kernel, so there is no
+runtime gate to initialize. The frame kernel writes the network-order header and
+optional mask key
 before masking the payload directly into its final immutable Python `bytes`
 allocation. Payloads up to 512 bytes use Python's integer XOR path because
 crossing ctypes costs more than the masking work at that size.

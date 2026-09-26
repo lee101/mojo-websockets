@@ -1,55 +1,9 @@
 """WebSocket wire kernels exported through a small C ABI."""
 
-from std.runtime import initialize_runtime
-from std.runtime.asyncrt import TaskGroup
 from std.sys.info import simd_width_of as simdwidthof
 
 comptime BPtr = Pointer[UInt8, AnyOrigin[mut=True]]
 comptime W = simdwidthof[DType.float64]()
-comptime MASK_CHUNK_SIZE = 1024 * 1024
-comptime MASK_WORKERS = 4
-
-
-@always_inline
-def sync_parallelize[FuncType: def(Int) -> None](func: FuncType, count: Int):
-    @__parameter
-    @always_inline
-    def wrapped(i: Int):
-        func(i)
-
-    @always_inline
-    @__parameter
-    async def task_fn(i: Int):
-        wrapped(i)
-
-    var tasks = TaskGroup()
-    for i in range(count):
-        tasks.create_task(task_fn(i))
-    tasks.wait()
-
-
-@always_inline
-def parallelize[
-    origins: OriginSet,
-    //,
-    func: def(Int) capturing[origins] -> None,
-](num_work_items: Int, num_workers: Int):
-    var workers = min(num_work_items, num_workers)
-    if workers <= 1:
-        for i in range(num_work_items):
-            func(i)
-        return
-
-    var chunk_size, extra_items = divmod(num_work_items, workers)
-
-    @always_inline
-    def worker(worker_index: Int) {imm chunk_size, imm extra_items}:
-        var start = worker_index * chunk_size + min(worker_index, extra_items)
-        for i in range(chunk_size + Int(worker_index < extra_items)):
-            func(start + i)
-
-    initialize_runtime()
-    sync_parallelize(worker, workers)
 
 
 def bytes_ptr(addr: Int) -> BPtr:
@@ -123,18 +77,6 @@ def mask_copy(src: BPtr, dst: BPtr, n: Int, mask: Int):
         i += 1
 
 
-def mask_copy_parallel(src: BPtr, dst: BPtr, n: Int, mask: Int):
-    var chunks = (n + MASK_CHUNK_SIZE - 1) // MASK_CHUNK_SIZE
-
-    @__parameter
-    def mask_chunk(chunk: Int):
-        var offset = chunk * MASK_CHUNK_SIZE
-        var size = min(MASK_CHUNK_SIZE, n - offset)
-        mask_copy(src.unsafe_offset(offset), dst.unsafe_offset(offset), size, mask)
-
-    parallelize[mask_chunk](chunks, MASK_WORKERS)
-
-
 @export("mws_apply_mask")
 def mws_apply_mask(
     src_addr: Int,
@@ -143,7 +85,6 @@ def mws_apply_mask(
     src_size: Int,
     dst_size: Int,
     mask: Int,
-    use_parallel: Int,
 ) abi("C") -> Int:
     if n < 0 or n > src_size or n > dst_size:
         return -1
@@ -151,12 +92,7 @@ def mws_apply_mask(
         return 0
     if src_addr == 0 or dst_addr == 0:
         return -2
-    var src = bytes_ptr(src_addr)
-    var dst = bytes_ptr(dst_addr)
-    if use_parallel != 0:
-        mask_copy_parallel(src, dst, n, mask)
-    else:
-        mask_copy(src, dst, n, mask)
+    mask_copy(bytes_ptr(src_addr), bytes_ptr(dst_addr), n, mask)
     return 0
 
 
@@ -170,7 +106,6 @@ def mws_serialize_frame(
     head1: Int,
     masked: Int,
     mask: Int,
-    use_parallel: Int,
 ) abi("C") -> Int:
     if n < 0 or n > src_size or head1 < 0 or head1 > 255:
         return -1
@@ -208,10 +143,7 @@ def mws_serialize_frame(
     if n > 0:
         var src = bytes_ptr(src_addr)
         if masked != 0:
-            if use_parallel != 0:
-                mask_copy_parallel(src, dst.unsafe_offset(offset), n, mask)
-            else:
-                mask_copy(src, dst.unsafe_offset(offset), n, mask)
+            mask_copy(src, dst.unsafe_offset(offset), n, mask)
         else:
             copy_bytes(src, dst.unsafe_offset(offset), n)
     return offset + n

@@ -4,10 +4,9 @@ from __future__ import annotations
 
 import sys
 
-from ._lib import bytes_address, ensure_parallel_runtime, lib, new_bytes, source_buffer
+from ._lib import bytes_address, lib, new_bytes, source_buffer
 
 BytesLike = bytes | bytearray | memoryview
-_PARALLEL_THRESHOLD = 4 * 1024 * 1024
 
 
 def apply_mask(data: BytesLike, mask: bytes | bytearray) -> bytes:
@@ -28,9 +27,6 @@ def apply_mask(data: BytesLike, mask: bytes | bytearray) -> bytes:
     destination = new_bytes(length)
     destination_address = bytes_address(destination)
     packed_mask = int.from_bytes(mask, "little")
-    use_parallel = int(
-        length >= _PARALLEL_THRESHOLD and ensure_parallel_runtime()
-    )
     status = lib().mws_apply_mask(
         source,
         destination_address,
@@ -38,7 +34,6 @@ def apply_mask(data: BytesLike, mask: bytes | bytearray) -> bytes:
         length,
         len(destination),
         packed_mask,
-        use_parallel,
     )
     # Keep the buffer exporter and its ctypes view alive through the native call.
     _ = source_owner

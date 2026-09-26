@@ -19,8 +19,8 @@ LIBRARY = Path(
 I = ctypes.c_int64
 P = ctypes.c_void_p
 _SIGNATURES = {
-    "mws_apply_mask": ([P, P, I, I, I, I, I], I),
-    "mws_serialize_frame": ([P, P, I, I, I, I, I, I, I], I),
+    "mws_apply_mask": ([P, P, I, I, I, I], I),
+    "mws_serialize_frame": ([P, P, I, I, I, I, I, I], I),
 }
 
 _allocate_bytes = ctypes.pythonapi.PyBytes_FromStringAndSize
@@ -31,7 +31,6 @@ _bytes_address.argtypes = [ctypes.py_object]
 _bytes_address.restype = ctypes.c_void_p
 
 _library: ctypes.CDLL | None = None
-_cpu_device: int | None = None
 
 
 class BuildError(RuntimeError):
@@ -67,20 +66,6 @@ def lib() -> ctypes.CDLL:
             function.argtypes = argtypes
             function.restype = restype
     return _library
-
-
-def ensure_parallel_runtime() -> bool:
-    global _cpu_device
-    if _cpu_device is not None:
-        return bool(_cpu_device)
-    try:
-        initialize = lib().KGEN_CompilerRT_AsyncRT_GetOrCreateCPUDevice
-        initialize.argtypes = []
-        initialize.restype = ctypes.c_void_p
-        _cpu_device = int(initialize() or 0)
-    except (AttributeError, OSError):
-        _cpu_device = 0
-    return bool(_cpu_device)
 
 
 def source_buffer(data: object) -> tuple[object, int, int]:

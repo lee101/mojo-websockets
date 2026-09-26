@@ -10,7 +10,7 @@ import struct
 from collections.abc import Generator, Sequence
 from typing import Callable
 
-from ._lib import bytes_address, ensure_parallel_runtime, lib, new_bytes
+from ._lib import bytes_address, lib, new_bytes
 from .exceptions import PayloadTooBig, ProtocolError
 from .utils import BytesLike, apply_mask
 
@@ -103,43 +103,6 @@ OK_CLOSE_CODES = {
 }
 
 
-def is_utf8_fragment(
-    data: bytes,
-    must_start_clean: bool = False,
-    must_end_clean: bool = False,
-) -> bool:
-    start, end = 0, len(data)
-    if not must_start_clean:
-        max_start = min(3, len(data))
-        while start < max_start and data[start] & 0xC0 == 0x80:
-            start += 1
-    if not must_end_clean and data:
-        end -= 1
-        min_end = max(len(data) - 4, start)
-        while end >= min_end:
-            byte = data[end]
-            if byte & 0xC0 == 0x80:
-                end -= 1
-                continue
-            if byte & 0x80 == 0:
-                sequence_length = 1
-            elif byte & 0xE0 == 0xC0:
-                sequence_length = 2
-            elif byte & 0xF0 == 0xE0:
-                sequence_length = 3
-            elif byte & 0xF8 == 0xF0:
-                sequence_length = 4
-            else:
-                sequence_length = 0
-            if sequence_length <= len(data) - end:
-                end = len(data)
-            break
-    try:
-        text = data[start:end].decode()
-    except UnicodeDecodeError:
-        return False
-    return "\\x" not in repr(text)
-
 
 def _serialize(payload: bytes, head1: int, mask: bool, mask_bytes: bytes) -> bytes:
     length = len(payload)
@@ -154,7 +117,6 @@ def _serialize(payload: bytes, head1: int, mask: bool, mask_bytes: bytes) -> byt
     header_size = 2 if length < 126 else 4 if length < 65536 else 10
     destination = new_bytes(header_size + 4 + length)
     packed_mask = int.from_bytes(mask_bytes, "little")
-    use_parallel = int(length >= 4 * 1024 * 1024 and ensure_parallel_runtime())
     written = lib().mws_serialize_frame(
         bytes_address(payload) if payload else 0,
         bytes_address(destination),
@@ -164,7 +126,6 @@ def _serialize(payload: bytes, head1: int, mask: bool, mask_bytes: bytes) -> byt
         head1,
         1,
         packed_mask,
-        use_parallel,
     )
     if written != len(destination):
         raise RuntimeError("Mojo frame serializer returned an invalid size")
@@ -253,39 +214,62 @@ class Frame:
                 raise ProtocolError("fragmented control frame")
 
     def __str__(self) -> str:
-        expected_text = self.DEFAULT_IS_TEXT.get(self.opcode)
+        expect_text = self.DEFAULT_IS_TEXT.get(self.opcode)
         data_repr, is_text = self._data_repr()
-        data_type = "" if expected_text == is_text else ("text" if is_text else "binary")
+        data_type = "" if expect_text == is_text else ("text" if is_text else "binary")
         length = f"{len(self.data)} byte{'' if len(self.data) == 1 else 's'}"
         non_final = "" if self.fin else "continued"
         metadata = ", ".join(filter(None, [data_type, length, non_final]))
         return f"{self.opcode.name} {data_repr} [{metadata}]"
 
     def _data_repr(self) -> tuple[str, bool | None]:
+        """Return the payload representation and whether it is text."""
         if not self.data:
             return "''", self.DEFAULT_IS_TEXT.get(self.opcode)
+
+        # Special case for close frames: parse the close code and reason.
+        # Fall back to the standard case if the payload is malformed.
         if self.opcode is OP_CLOSE:
             try:
                 return str(Close.parse(self.data)), True
             except (ProtocolError, UnicodeDecodeError):
                 pass
-        raw = bytes(self.data)
-        is_text = is_utf8_fragment(
-            raw,
-            must_start_clean=self.opcode != OP_CONT,
-            must_end_clean=self.fin,
-        )
-        if is_text:
-            data_repr = repr(raw.decode(errors="replace"))
+
+        # Guess whether the payload is UTF-8 or binary, regardless of opcode,
+        # to display UTF-8 text in binary frames nicely and generally to be
+        # helpful and robust. Also support frames fragmented within sequences.
+        if len(self.data) > 4 * self.MAX_LOG_SIZE:
+            # Process only the start and the end, as the middle will be elided.
+            data_start = bytes(self.data[: 8 * self.MAX_LOG_SIZE // 3])
+            data_end = bytes(self.data[-4 * self.MAX_LOG_SIZE // 3 :])
+            is_text = is_utf8_fragment(
+                data_start, must_start_clean=self.opcode != OP_CONT
+            ) and is_utf8_fragment(data_end, must_end_clean=self.fin)
+            if is_text:
+                data_repr = repr((data_start + data_end).decode(errors="replace"))
         else:
-            binary = raw
+            data = bytes(self.data)
+            is_text = is_utf8_fragment(
+                data,
+                must_start_clean=self.opcode != OP_CONT,
+                must_end_clean=self.fin,
+            )
+            if is_text:
+                data_repr = repr(data.decode(errors="replace"))
+
+        # When the payload is text (except perhaps for boundaries), we decoded
+        # enough in ``data_repr``. Now, do the same when the payload is binary.
+        if not is_text:
+            binary = self.data
             if len(binary) > self.MAX_LOG_SIZE // 3:
                 cut = (self.MAX_LOG_SIZE // 3 - 1) // 3
-                binary = binary[: 2 * cut] + b"\x00\x00" + binary[-cut:]
-            data_repr = binary.hex(" ")
+                binary = b"".join([binary[: 2 * cut], b"\x00\x00", binary[-cut:]])
+            data_repr = " ".join(f"{byte:02x}" for byte in binary)
+
         if len(data_repr) > self.MAX_LOG_SIZE:
             cut = self.MAX_LOG_SIZE // 3 - 1
             data_repr = data_repr[: 2 * cut] + "..." + data_repr[-cut:]
+
         return data_repr, is_text
 
 
@@ -324,6 +308,78 @@ class Close:
     def check(self) -> None:
         if not (self.code in EXTERNAL_CLOSE_CODES or 3000 <= self.code < 5000):
             raise ProtocolError("invalid status code")
+
+
+def is_utf8_fragment(
+    data: bytes,
+    must_start_clean: bool = False,
+    must_end_clean: bool = False,
+) -> bool:
+    """Guess if data is a fragment of UTF-8 text."""
+    # Possible byte sequences for UTF-8 characters are:
+    # 0xxxxxxx
+    # 110xxxxx 10xxxxxx
+    # 1110xxxx 10xxxxxx 10xxxxxx
+    # 11110xxx 10xxxxxx 10xxxxxx 10xxxxxx
+
+    # The algorithm determines ``start`` and ``end`` so that ``data[start:end]``
+    # must be a valid UTF-8 sequence for data to be a valid UTF-8 fragment.
+
+    start, end = 0, len(data)
+
+    if not must_start_clean:
+        # Remove continuation bytes from the beginning.
+        max_start = min(3, len(data))
+        while start < max_start:
+            byte = data[start]
+
+            # Continuation byte
+            if byte & 0b11000000 == 0b10000000:
+                start += 1
+                continue
+
+            break
+
+    if not must_end_clean:
+        # Remove a partial multibyte sequence from the end.
+        end -= 1  # index of the last byte
+        min_end = max(len(data) - 4, start)
+        while end >= min_end:
+            byte = data[end]
+            # Continuation byte
+            if byte & 0b11000000 == 0b10000000:
+                end -= 1
+                continue
+
+            # ASCII byte
+            if byte & 0b10000000 == 0b00000000:
+                seq_len = 1
+            # Leading byte of a 2-byte sequence
+            elif byte & 0b11100000 == 0b11000000:
+                seq_len = 2
+            # Leading byte of a 3-byte sequence
+            elif byte & 0b11110000 == 0b11100000:
+                seq_len = 3
+            # Leading byte of a 4-byte sequence
+            elif byte & 0b11111000 == 0b11110000:
+                seq_len = 4
+            # Invalid byte
+            else:
+                seq_len = 0
+
+            # Cut only when there's an incomplete sequence at the end.
+            if seq_len <= len(data) - end:
+                end = len(data)
+
+            break
+
+    try:
+        text = data[start:end].decode()
+    except UnicodeDecodeError:
+        return False
+    else:
+        # Non-printable characters signal binary data.
+        return "\\x" not in repr(text)
 
 
 from . import extensions

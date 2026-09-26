@@ -121,14 +121,14 @@ def test_source_buffer_retains_numpy_exporter():
 def test_native_mask_rejects_invalid_lengths_and_null_pointers():
     destination = b"\0" * 8
     assert lib().mws_apply_mask(
-        0, bytes_address(destination), 1, 1, len(destination), 0, 0
+        0, bytes_address(destination), 1, 1, len(destination), 0
     ) == -2
     assert lib().mws_apply_mask(
-        0, bytes_address(destination), 9, 8, len(destination), 0, 0
+        0, bytes_address(destination), 9, 8, len(destination), 0
     ) == -1
 
 
-def test_native_parallel_mask_handles_chunk_and_simd_tail():
+def test_native_mask_handles_unroll_and_simd_tail():
     length = 1024 * 1024 + 13
     source = bytes((index * 37 + 11) & 255 for index in range(length))
     destination = new_bytes(length)
@@ -140,7 +140,6 @@ def test_native_parallel_mask_handles_chunk_and_simd_tail():
         length,
         length,
         int.from_bytes(mask, "little"),
-        1,
     )
     assert status == 0
     assert destination == reference_utils.apply_mask(source, mask)
@@ -158,37 +157,16 @@ def test_native_serializer_rejects_undersized_destination():
         0x82,
         0,
         0,
-        0,
     ) == -1
 
 
-def test_apply_mask_parallel_threshold(monkeypatch):
-    threshold = mojo_utils._PARALLEL_THRESHOLD
-    calls = []
-    initialize = mojo_utils.ensure_parallel_runtime
-
-    def track_runtime_initialization():
-        calls.append(True)
-        return initialize()
-
-    monkeypatch.setattr(
-        mojo_utils,
-        "ensure_parallel_runtime",
-        track_runtime_initialization,
-    )
+def test_apply_mask_is_exact_for_mib_sized_payloads():
+    """The kernel stays on one code path, so every length must match upstream."""
     mask = b"\x12\x34\x56\x78"
-    serial_data = bytes(range(256)) * ((threshold - 1) // 256) + b"x" * 255
-    parallel_data = serial_data + b"tail"
-    assert len(serial_data) == threshold - 1
-    assert len(parallel_data) == threshold + 3
-    assert apply_mask(serial_data, mask) == reference_utils.apply_mask(
-        serial_data, mask
-    )
-    assert calls == []
-    assert apply_mask(parallel_data, mask) == reference_utils.apply_mask(
-        parallel_data, mask
-    )
-    assert calls == [True]
+    for length in (513, 4 * 1024 * 1024 - 1, 4 * 1024 * 1024 + 3, 8 * 1024 * 1024):
+        data = bytes((index * 131 + 17) & 255 for index in range(length))
+        assert apply_mask(data, mask) == reference_utils.apply_mask(data, mask)
+
 
 
 @pytest.mark.parametrize("mask", [b"", b"123", b"12345"])
@@ -216,10 +194,10 @@ def test_masked_serialization_matches_upstream(length, monkeypatch):
     assert ours == theirs
 
 
-def test_large_masked_serialization_uses_parallel_path(monkeypatch):
+def test_large_masked_serialization_matches_upstream(monkeypatch):
     key = b"\xde\xad\xbe\xef"
     monkeypatch.setattr(frames.secrets, "token_bytes", lambda size: key)
-    length = mojo_utils._PARALLEL_THRESHOLD + 3
+    length = 4 * 1024 * 1024 + 3
     payload = bytes(range(256)) * (length // 256) + b"xyz"
     ours = frames.Frame(frames.OP_BINARY, payload).serialize(mask=True)
     theirs = reference.Frame(reference.OP_BINARY, payload).serialize(mask=True)
@@ -374,6 +352,14 @@ def test_close_rejects_invalid_utf8():
         frames.Close.parse(b"\x03\xe8\xff")
 
 
+def render(frame):
+    """Render a frame the way upstream does, including its decode failures."""
+    try:
+        return str(frame)
+    except UnicodeDecodeError:
+        return "UnicodeDecodeError"
+
+
 @pytest.mark.parametrize(
     "frame",
     [
@@ -394,7 +380,46 @@ def test_frame_string_matches_upstream(frame):
         frame.rsv2,
         frame.rsv3,
     )
-    assert str(frame) == str(theirs)
+    assert render(frame) == render(theirs)
+
+
+@pytest.mark.parametrize(
+    ("opcode", "payload", "fin"),
+    [
+        # The payload is classified by content, not by opcode.
+        pytest.param(frames.OP_BINARY, "héllo".encode(), True, id="binary-utf8"),
+        pytest.param(frames.OP_PING, b"ping", True, id="ping-utf8"),
+        pytest.param(frames.OP_PONG, b"\xf0\x9f\x98\x80", True, id="pong-utf8"),
+        # Continuation frames may start and end inside a UTF-8 sequence.
+        pytest.param(frames.OP_CONT, b"\xf0\x9f\x98", False, id="cont-partial-start"),
+        pytest.param(frames.OP_CONT, b"\x98\x80tail", True, id="cont-partial-start-2"),
+        pytest.param(frames.OP_TEXT, b"\xf0\x9f\x98", False, id="text-partial-start"),
+        # A non-final frame may end with a partial sequence; a final one may not.
+        pytest.param(frames.OP_TEXT, b"head\xe2\x82", False, id="text-partial-end"),
+        pytest.param(frames.OP_TEXT, b"head\xe2\x82", True, id="text-partial-end-fin"),
+        # Control characters mark binary payloads even when they decode.
+        pytest.param(frames.OP_TEXT, b"\x1b[0m", True, id="text-control-char"),
+        pytest.param(frames.OP_BINARY, b"\x00", True, id="binary-nul"),
+        # Malformed close payloads fall back to the same content heuristic.
+        pytest.param(frames.OP_CLOSE, b"\x03", True, id="close-too-short"),
+        pytest.param(frames.OP_CLOSE, b"\x03\xe8\xff", True, id="close-bad-utf8"),
+        pytest.param(frames.OP_CLOSE, b"hello", True, id="close-not-a-close"),
+        # Payloads longer than four times MAX_LOG_SIZE take the elided path.
+        pytest.param(frames.OP_TEXT, "é".encode() * 200, True, id="long-text"),
+        pytest.param(frames.OP_BINARY, bytes(400), True, id="long-binary"),
+        # The elided middle of a long payload is not classified.
+        pytest.param(
+            frames.OP_TEXT,
+            b"a" * 200 + b"\xff" + b"a" * 199,
+            True,
+            id="long-binary-middle",
+        ),
+    ],
+)
+def test_frame_string_classification_matches_upstream(opcode, payload, fin):
+    ours = frames.Frame(opcode, payload, fin=fin)
+    theirs = reference.Frame(reference.Opcode(opcode), payload, fin=fin)
+    assert render(ours) == render(theirs)
 
 
 def test_public_signatures_match_upstream():
